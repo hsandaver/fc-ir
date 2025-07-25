@@ -1,0 +1,12 @@
+altair
+pandas
+numpy
+packaging
+Pillow
+plotly
+scikit-learn
+streamlit>=1.38.0
+opencv-python
+rasterio
+tifffile
+streamlit-image-coordinates
