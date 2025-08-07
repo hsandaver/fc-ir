@@ -609,15 +609,20 @@ class FalseColourApp:
         
         c1, c2, c3 = st.columns(3)
         dims = ['PC1', 'PC2', 'PC3']
-        x_ax, y_ax, c_ax = c1.selectbox('X',dims,0), c2.selectbox('Y',dims,1), c3.selectbox('Color',dims,2)
+        x_ax, y_ax, c_ax = c1.selectbox('X', dims, 0), c2.selectbox('Y', dims, 1), c3.selectbox('Color', dims, 2)
         
         fig = px.scatter(df_sample, x=x_ax, y=y_ax, color=c_ax, opacity=0.6)
         fig.update_layout(dragmode='lasso')
         sel = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
         
-        if not sel.selection or not sel.selection['points']: return
+        if not sel.selection or not sel.selection['points']:
+            return
 
-        selected_indices = [p['pointIndex'] for p in sel.selection['points']]
+        # --- THIS IS THE CORRECTED LINE ---
+        # The key was changed from 'pointIndex' to 'point_index'
+        selected_indices = [p['point_index'] for p in sel.selection['points']]
+        # --- END OF CORRECTION ---
+
         original_indices = df_sample.index[selected_indices]
         
         h, w = display_rgb.shape[:2]
@@ -631,7 +636,7 @@ class FalseColourApp:
         with tab_overlay:
             mask = np.zeros((h, w), dtype=bool)
             mask[rows, cols] = True
-            overlay = np.where(mask[..., None], (display_rgb*0.5 + [127,0,0]).astype(np.uint8), display_rgb)
+            overlay = np.where(mask[..., None], (display_rgb * 0.5 + [127, 0, 0]).astype(np.uint8), display_rgb)
             st.image(overlay, use_container_width=True)
 
     def _run_batch_mode(self):
