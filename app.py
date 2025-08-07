@@ -609,25 +609,24 @@ class FalseColourApp:
         df_pca = pd.DataFrame({f'PC{i+1}': pc.flatten() for i, pc in enumerate(self.pca_components)})
         max_pts = st.slider('Max points to plot', 1000, len(df_pca), 50000, 1000)
         df_sample = df_pca.sample(n=max_pts, random_state=1)
-        
+
         c1, c2, c3 = st.columns(3)
         dims = ['PC1', 'PC2', 'PC3']
         x_ax, y_ax, c_ax = c1.selectbox('X', dims, 0), c2.selectbox('Y', dims, 1), c3.selectbox('Color', dims, 2)
-        
+
         fig = px.scatter(df_sample, x=x_ax, y=y_ax, color=c_ax, opacity=0.6)
+        # Store the original flattened pixel index with each point so we can recover it later
+        fig.update_traces(customdata=df_sample.index.to_numpy())
         fig.update_layout(dragmode='lasso')
         sel = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
-        
-        if not sel.selection or not sel.selection['points']:
+
+        # Abort if no selection data are available
+        if sel is None or "points" not in sel or len(sel["points"]) == 0:
             return
 
-        # --- THIS IS THE CORRECTED LINE ---
-        # The key was changed from 'pointIndex' to 'point_index'
-        selected_indices = [p['point_index'] for p in sel.selection['points']]
-        # --- END OF CORRECTION ---
+        # Recover the original flattened pixel indices from the customdata field
+        original_indices = [p["customdata"] for p in sel["points"]]
 
-        original_indices = df_sample.index[selected_indices]
-        
         h, w = display_rgb.shape[:2]
         rows, cols = np.unravel_index(original_indices, (h, w))
 
