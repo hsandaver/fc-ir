@@ -983,17 +983,36 @@ class FalseColourApp:
         fig.update_layout(dragmode='lasso', hovermode='closest')
         st.plotly_chart(fig, use_container_width=True, key="pca_plot")
 
-        state = st.session_state.get("pca_plot")
+        # --- Retrieve Plotly selection payload (key names vary across Streamlit versions) ---
         original_indices = np.array([], dtype=int)
-        if state and isinstance(state, dict):
-            sel = state.get("selection") or state.get("selectedData") or state.get("select") or {}
-            if isinstance(sel, dict) and sel.get("points"):
-                pts = sel["points"]
-                if isinstance(pts, list) and len(pts) > 0 and "customdata" in pts[0]:
-                    try:
-                        original_indices = np.asarray([int(p["customdata"][0]) for p in pts])
-                    except Exception:
-                        original_indices = np.array([], dtype=int)
+
+        possible_keys = [
+            "pca_plot",                       # older Streamlit (<1.23)
+            "pca_plot-selectedData",          # Streamlit 1.23–1.26 style
+            "pca_plot_select",                # some nightly builds
+        ]
+
+        sel_payload = None
+        for k in possible_keys:
+            obj = st.session_state.get(k)
+            if isinstance(obj, dict) and ("points" in obj or "selectedData" in obj):
+                sel_payload = obj.get("selectedData", obj)   # prefer selectedData if nested
+                break
+
+        # Fallback: check dict inside the main key
+        if sel_payload is None:
+            state = st.session_state.get("pca_plot")
+            if isinstance(state, dict):
+                sel_payload = state.get("selection") or state.get("selectedData") or state.get("select")
+
+        # Parse points if we finally got something
+        if isinstance(sel_payload, dict) and sel_payload.get("points"):
+            pts = sel_payload["points"]
+            if isinstance(pts, list) and len(pts) > 0 and "customdata" in pts[0]:
+                try:
+                    original_indices = np.asarray([int(p["customdata"][0]) for p in pts])
+                except Exception:
+                    original_indices = np.array([], dtype=int)
 
         if original_indices.size == 0:
             return
