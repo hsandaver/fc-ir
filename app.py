@@ -1,7 +1,7 @@
 import io
 import json
 import zipfile
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional, Union
 
@@ -188,9 +188,9 @@ class AppParams:
     saturation: float = 1.0
     pre_equalize: bool = True
     make_pca_helper: bool = False
-    pca_opts: PCAOptions = field(default_factory=lambda: PCAOptions(map={"R": "PC1", "G": "PC2", "B": "PC3"}))
+    pca_opts: PCAOptions = PCAOptions(map={"R": "PC1", "G": "PC2", "B": "PC3"})
     make_ratio: bool = False
-    ratio_opts: RatioOptions = field(default_factory=RatioOptions)
+    ratio_opts: RatioOptions = RatioOptions()
 
 
 # -----------------------------------------------------------------------------
@@ -986,7 +986,7 @@ class FalseColourApp:
         state = st.session_state.get("pca_plot")
         original_indices = np.array([], dtype=int)
         if state and isinstance(state, dict):
-            sel = state.get("selection") or state.get("select") or {}
+            sel = state.get("selection") or state.get("selectedData") or state.get("select") or {}
             if isinstance(sel, dict) and sel.get("points"):
                 pts = sel["points"]
                 if isinstance(pts, list) and len(pts) > 0 and "customdata" in pts[0]:
