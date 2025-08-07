@@ -13,6 +13,13 @@ import plotly.express as px
 import textwrap
 from sklearn.decomposition import PCA
 
+# --- Optional: capture Plotly lasso selections via streamlit-plotly-events ---
+try:
+    from streamlit_plotly_events import plotly_events
+    HAS_PLOTLY_EVENTS = True
+except ImportError:
+    HAS_PLOTLY_EVENTS = False
+
 # --- Streamlit version check for Plotly flicker workaround ---
 from packaging import version
 
@@ -979,34 +986,21 @@ class FalseColourApp:
         df_sample = df_sample.copy()
         df_sample['__orig_index__'] = df_sample.index.values
 
-        fig = px.scatter(df_sample, x=x_axis, y=y_axis, color=color_axis, opacity=0.6, title=f"{x_axis} vs {y_axis}", height=600, custom_data=['__orig_index__'])
+        fig = px.scatter(
+            df_sample, x=x_axis, y=y_axis, color=color_axis, opacity=0.6,
+            title=f"{x_axis} vs {y_axis}", height=600, custom_data=['__orig_index__']
+        )
         fig.update_layout(dragmode='lasso', hovermode='closest')
-        st.plotly_chart(fig, use_container_width=True, key="pca_plot")
 
-        # --- Retrieve Plotly selection payload, regardless of Streamlit key naming ---
-        original_indices = np.array([], dtype=int)
-        sel_payload = None
-
-        # Any dict in session_state that contains a non‑empty "points" list is likely the one
-        for k, v in st.session_state.items():
-            if isinstance(v, dict):
-                # Some versions nest the payload under "selectedData"
-                candidate = v.get("selectedData", v)
-                if isinstance(candidate, dict) and candidate.get("points"):
-                    sel_payload = candidate
-                    break  # take the first match
-
-        # Parse points if we finally got something
-        if isinstance(sel_payload, dict) and sel_payload.get("points"):
-            pts = sel_payload["points"]
-            if isinstance(pts, list) and len(pts) > 0 and "customdata" in pts[0]:
-                try:
-                    original_indices = np.asarray([int(p["customdata"][0]) for p in pts])
-                except Exception:
-                    original_indices = np.array([], dtype=int)
-
-        if original_indices.size == 0:
+        # --- Capture lasso selections using streamlit-plotly-events if available ---
+        if not HAS_PLOTLY_EVENTS:
+            st.info("Install `streamlit-plotly-events` to enable PCA lasso selection and overlay.")
             return
+        selected_points = plotly_events(fig, key="pca_events", override_height=600)
+        if not selected_points:
+            return
+        # Extract original pixel indices from selection
+        original_indices = np.array([int(p["customdata"][0]) for p in selected_points])
 
         # Shared variables for both tabs
         chan_map = self.params.channel_map
@@ -1018,7 +1012,12 @@ class FalseColourApp:
             lwp_mean = self.raw_bands[chan_map['R']][rows, cols].mean()
             bp_mean  = self.raw_bands[chan_map['G']][rows, cols].mean()
             swp_mean = self.raw_bands[chan_map['B']][rows, cols].mean()
-            spec_fig = px.bar(x=['LWP', 'BP', 'SWP'], y=[lwp_mean, bp_mean, swp_mean], labels={'x': 'Band', 'y': 'Mean Raw Value'}, title="Mean Signature")
+            spec_fig = px.bar(
+                x=['LWP', 'BP', 'SWP'],
+                y=[lwp_mean, bp_mean, swp_mean],
+                labels={'x': 'Band', 'y': 'Mean Raw Value'},
+                title="Mean Signature"
+            )
             st.plotly_chart(spec_fig, use_container_width=True)
 
         with tab_overlay:
