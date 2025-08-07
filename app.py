@@ -996,7 +996,14 @@ class FalseColourApp:
         if not HAS_PLOTLY_EVENTS:
             st.info("Install `streamlit-plotly-events` to enable PCA lasso selection and overlay.")
             return
-        selected_points = plotly_events(fig, key="pca_events", override_height=600)
+        # (Optional) Force display chart before event capture for marker rendering
+        st.plotly_chart(fig, use_container_width=True)
+        selected_points = plotly_events(
+            fig,
+            key="pca_events",
+            override_height=600,
+            select_event=True
+        )
         if not selected_points:
             return
         # Extract original pixel indices from selection
