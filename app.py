@@ -983,27 +983,18 @@ class FalseColourApp:
         fig.update_layout(dragmode='lasso', hovermode='closest')
         st.plotly_chart(fig, use_container_width=True, key="pca_plot")
 
-        # --- Retrieve Plotly selection payload (key names vary across Streamlit versions) ---
+        # --- Retrieve Plotly selection payload, regardless of Streamlit key naming ---
         original_indices = np.array([], dtype=int)
-
-        possible_keys = [
-            "pca_plot",                       # older Streamlit (<1.23)
-            "pca_plot-selectedData",          # Streamlit 1.23–1.26 style
-            "pca_plot_select",                # some nightly builds
-        ]
-
         sel_payload = None
-        for k in possible_keys:
-            obj = st.session_state.get(k)
-            if isinstance(obj, dict) and ("points" in obj or "selectedData" in obj):
-                sel_payload = obj.get("selectedData", obj)   # prefer selectedData if nested
-                break
 
-        # Fallback: check dict inside the main key
-        if sel_payload is None:
-            state = st.session_state.get("pca_plot")
-            if isinstance(state, dict):
-                sel_payload = state.get("selection") or state.get("selectedData") or state.get("select")
+        # Any dict in session_state that contains a non‑empty "points" list is likely the one
+        for k, v in st.session_state.items():
+            if isinstance(v, dict):
+                # Some versions nest the payload under "selectedData"
+                candidate = v.get("selectedData", v)
+                if isinstance(candidate, dict) and candidate.get("points"):
+                    sel_payload = candidate
+                    break  # take the first match
 
         # Parse points if we finally got something
         if isinstance(sel_payload, dict) and sel_payload.get("points"):
