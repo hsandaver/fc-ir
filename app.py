@@ -9,27 +9,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from streamlit_extras.image_selector import image_selector
 import plotly.express as px
 import textwrap
 from sklearn.decomposition import PCA
-
-# --- Helper: percentile stretch and gamma correction ---
-def stretch_and_gamma(arr: np.ndarray, low_p: float, high_p: float, gamma: float) -> np.ndarray:
-    """
-    Percentile-based stretch and optional gamma correction.
-    """
-    lo, hi = np.percentile(arr, (low_p, high_p))
-    arr_clipped = np.clip((arr - lo) / (hi - lo + EPSILON), 0, 1)
-    if gamma != 1.0:
-        arr_clipped = np.power(arr_clipped, 1.0 / gamma)
-    return (arr_clipped * 255.0).astype(np.uint8)
-
-# --- Optional: capture Plotly lasso selections via streamlit-plotly-events ---
-try:
-    from streamlit_plotly_events import plotly_events
-    HAS_PLOTLY_EVENTS = True
-except ImportError:
-    HAS_PLOTLY_EVENTS = False
 
 # --- Streamlit version check for Plotly flicker workaround ---
 from packaging import version
@@ -205,6 +188,8 @@ class AppParams:
     use_decor: bool = False
     saturation: float = 1.0
     pre_equalize: bool = True
+    align_bands: bool = False
+    align_ref: str = "R"
     make_pca_helper: bool = False
     pca_opts: PCAOptions = field(default_factory=lambda: PCAOptions(map={"R": "PC1", "G": "PC2", "B": "PC3"}))
     make_ratio: bool = False
@@ -284,7 +269,7 @@ class FalseColourApp:
         return (img_sat * 255.0).astype(np.uint8)
 
     def _align_bands(self, ref: np.ndarray, mov: np.ndarray) -> np.ndarray:
-        """ECC alignment (if OpenCV available)."""
+        """ECC alignment (if OpenCV available). ECC requires single‑channel 8‑bit or 32‑bit images."""
         if not HAS_OPENCV:
             return mov
         if ref.shape != mov.shape:
@@ -332,31 +317,23 @@ class FalseColourApp:
     def _stretch_percentile_gamma(self, arr, low_p, high_p, gamma):
         """
         Apply percentile-based stretch and gamma correction to an array.
+        Uses NaN-safe statistics and guards against zero-range inputs.
         """
-        return stretch_and_gamma(arr, low_p, high_p, gamma)
-
-    def _compute_gains(self, R: np.ndarray, G: np.ndarray, B: np.ndarray) -> list:
-        """
-        Compute color balance gains based on white patch, auto-balance, or manual gains.
-        """
-        if self.white_patch_enabled and self.white_patch_coords is not None:
-            x1, y1, x2, y2 = self.white_patch_coords
-            ref_means = {
-                'R': float(R[y1:y2, x1:x2].mean()),
-                'G': float(G[y1:y2, x1:x2].mean()),
-                'B': float(B[y1:y2, x1:x1+0].mean())  # B uses same coords
-            }
-            target = np.mean(list(ref_means.values()))
-            return [
-                _safe_divide(target, ref_means['R']),
-                _safe_divide(target, ref_means['G']),
-                _safe_divide(target, ref_means['B']),
-            ]
-        if self.params.auto_balance:
-            means = [float(R.mean()), float(G.mean()), float(B.mean())]
-            target = np.mean([m for m in means if m > EPSILON])
-            return [target / (m + EPSILON) for m in means]
-        return self.params.gains or [1.0, 1.0, 1.0]
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        # Compute lower and upper percentile values (NaN‑robust)
+        lo, hi = np.nanpercentile(arr, (low_p, high_p))
+        # Guard against empty/constant arrays
+        if not np.isfinite(lo) or not np.isfinite(hi) or (hi - lo) <= EPSILON:
+            return np.zeros_like(arr, dtype=np.uint8)
+        # Clip to the percentile range
+        arr_clipped = np.clip(arr, lo, hi)
+        # Scale to 0‑255 range
+        scale = 255.0 / (hi - lo + EPSILON)
+        stretched = (arr_clipped - lo) * scale
+        # Apply gamma correction if needed
+        if gamma != 1.0:
+            stretched = np.power(np.clip(stretched / 255.0, 0.0, 1.0), 1.0 / gamma) * 255.0
+        return np.clip(stretched, 0, 255).astype(np.uint8)
     # ------------------------------ UI --------------------------------
     def _setup_sidebar(self):
         st.sidebar.header("1. Upload Bands")
@@ -455,6 +432,22 @@ class FalseColourApp:
                 "Normalize band means (pre-stretch)", value=True,
                 help="Scales raw bands so their global means match before other processing."
             )
+            # --- Optional band alignment (OpenCV ECC) ---
+            st.markdown("**Alignment**")
+            self.params.align_bands = st.checkbox(
+                "Align bands to a reference (ECC, OpenCV)",
+                value=False,
+                help=(
+                    "Aligns the other two channels to the selected reference using cv2.findTransformECC. "
+                    "Requires OpenCV; works best with contrasty, well-exposed images."
+                ),
+            )
+            self.params.align_ref = st.selectbox(
+                "Alignment reference channel",
+                ["R", "G", "B"],
+                index=0,
+                help="The selected channel remains fixed; the others are warped to match.",
+            )
             self.params.make_pca_helper = st.checkbox(
                 "Generate PCA helper composite", value=False,
                 help="Creates an extra RGB image from principal components to highlight subtle variance."
@@ -515,6 +508,27 @@ class FalseColourApp:
         # Optional dark / flat corrections (raw domain)
         self._apply_dark_flat_correction()
 
+        # Optional band alignment (ECC) prior to normalization/stretching
+        if self.params.align_bands:
+            if not HAS_OPENCV:
+                st.warning("OpenCV not available; skipping alignment.")
+            else:
+                ref_key = self.params.align_ref
+                ref = self.source_bands[ref_key].astype(np.float32)
+                # Normalize to 0-255 uint8 for ECC stability
+                ref_norm = (ref - np.nanmin(ref)) / (np.nanmax(ref) - np.nanmin(ref) + EPSILON)
+                ref_u8 = np.clip(ref_norm * 255.0, 0, 255).astype(np.uint8)
+                for k in ["R", "G", "B"]:
+                    if k == ref_key:
+                        continue
+                    mov = self.source_bands[k].astype(np.float32)
+                    mov_norm = (mov - np.nanmin(mov)) / (np.nanmax(mov) - np.nanmin(mov) + EPSILON)
+                    mov_u8 = np.clip(mov_norm * 255.0, 0, 255).astype(np.uint8)
+                    aligned_u8 = self._align_bands(ref_u8, mov_u8)
+                    # Rescale back to the original dynamic range of the moving band
+                    mov_min, mov_max = float(np.nanmin(mov)), float(np.nanmax(mov))
+                    self.source_bands[k] = aligned_u8.astype(np.float32) * ((mov_max - mov_min) / 255.0) + mov_min
+
         # ... rest of the processing logic ...
         # Step 1.5: Optional pre-stretch normalization
         if self.params.pre_equalize:
@@ -533,7 +547,27 @@ class FalseColourApp:
 
         # Step 3: Color balance
         R, G, B = stretched_channels['R'], stretched_channels['G'], stretched_channels['B']
-        gains = self._compute_gains(R, G, B)
+        gains = [1.0, 1.0, 1.0]
+        if self.white_patch_enabled and self.white_patch_coords is not None:
+            x1, y1, x2, y2 = self.white_patch_coords
+            ref_means = {
+                'R': float(R[y1:y2, x1:x2].mean()),
+                'G': float(G[y1:y2, x1:x2].mean()),
+                'B': float(B[y1:y2, x1:x2].mean()),
+            }
+            target_mean = np.mean(list(ref_means.values()))
+            gains = [
+                _safe_divide(target_mean, ref_means['R']),
+                _safe_divide(target_mean, ref_means['G']),
+                _safe_divide(target_mean, ref_means['B']),
+            ]
+        elif self.params.auto_balance:
+            means = [R.mean(), G.mean(), B.mean()]
+            target_mean = np.mean([m for m in means if m > EPSILON])
+            gains = [target_mean / (m + EPSILON) for m in means]
+        else:
+            gains = self.params.gains if self.params.gains is not None else [1.0, 1.0, 1.0]
+
         R = np.clip(R.astype(np.float32) * gains[0], 0, 255).astype(np.uint8)
         G = np.clip(G.astype(np.float32) * gains[1], 0, 255).astype(np.uint8)
         B = np.clip(B.astype(np.float32) * gains[2], 0, 255).astype(np.uint8)
@@ -616,7 +650,8 @@ class FalseColourApp:
         formula = self.params.ratio_opts.formula
         # DEBUG: Show selected formula and channel ranges
         import streamlit as st
-        st.write(f"🔧 Ratio formula: {formula}")
+        if st.session_state.get("pc_debug", False):
+            st.write(f"🔧 Ratio formula: {formula}")
         # Define raw bands for SWP and BP
         chan_map = self.params.channel_map
         raw_bp = self.raw_bands[chan_map['G']].astype(np.float32)
@@ -649,70 +684,146 @@ class FalseColourApp:
         ro = self.params.ratio_opts
         lo_p, hi_p = ro.low * 100, ro.high * 100
 
-        ch_r = stretch_and_gamma((ch_r*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
-        ch_g = stretch_and_gamma((ch_g*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
-        ch_b = stretch_and_gamma((ch_b*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
+        def _stretch_ratio(arr):
+            lo, hi = np.percentile(arr, (lo_p, hi_p))
+            arr_clip = np.clip((arr - lo) / (hi - lo + EPSILON), 0, 1)
+            if ro.gamma != 1.0:
+                arr_clip = np.power(arr_clip, 1.0 / ro.gamma)
+            return arr_clip
+
+        ch_r = _stretch_ratio(ch_r)
+        ch_g = _stretch_ratio(ch_g)
+        ch_b = _stretch_ratio(ch_b)
 
         # DEBUG: Print raw min/max for each channel before normalization
         for name, arr in [("R", ch_r), ("G", ch_g), ("B", ch_b)]:
-            st.write(f"🔍 {name} channel before norm: min={float(np.nanmin(arr)):.4f}, max={float(np.nanmax(arr)):.4f}")
+            if st.session_state.get("pc_debug", False):
+                st.write(f"🔍 {name} channel before norm: min={float(np.nanmin(arr)):.4f}, max={float(np.nanmax(arr)):.4f}")
 
-        self.ratio_rgb = np.dstack([ch_r, ch_g, ch_b])
+        def norm8(x: np.ndarray) -> np.uint8:
+            x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            mn, mx = x.min(), x.max()
+            if mx - mn <= EPSILON:
+                return np.zeros_like(x, dtype=np.uint8)
+            x = (x - mn) / (mx - mn)
+            return (x * 255).astype(np.uint8)
+
+        self.ratio_rgb = np.dstack([norm8(ch_r), norm8(ch_g), norm8(ch_b)])
 
 
     def _display_roi_analysis(self, final_rgb: np.ndarray) -> np.ndarray:
-        """Handles the UI and logic for ROI selection and analysis."""
         st.subheader("Region of Interest (ROI) Analysis")
-        enable_roi = st.checkbox("Enable ROI controls", value=False)
-        if not enable_roi:
+
+        # --- Interactive lasso / box selector ------------------------
+        sel = image_selector(
+            final_rgb,
+            selection_type="lasso",          # or "box" – user can switch later
+            key="roi_selector",
+            width=final_rgb.shape[1],
+        )
+
+        # ------------------------------------------------------------------
+        # Validate selection payload (image_selector may return empty lists
+        # when the user has not yet finished drawing or has cleared the ROI)
+        # ------------------------------------------------------------------
+        selections = sel.get("selection", {}) if isinstance(sel, dict) else {}
+        lasso_raw = selections.get("lasso", [])
+        box_raw   = selections.get("box", [])
+        if (not lasso_raw) and (not box_raw):
+            st.info("Draw a lasso or box on the image to analyse that region.")
             return final_rgb
 
-        h, w = final_rgb.shape[:2]
-        c1, c2 = st.columns(2)
-        with c1:
-            x1, x2 = st.slider("X range (columns)", 0, w-1, (int(w*0.25), int(w*0.75)))
-        with c2:
-            y1, y2 = st.slider("Y range (rows)", 0, h-1, (int(h*0.25), int(h*0.75)))
+        # --- Convert selection → Boolean mask ------------------------
+        import numpy as np
 
-        # Get ROI data from all relevant stages
-        R, G, B = self.processed_channels['R'], self.processed_channels['G'], self.processed_channels['B']
-        roi_R, roi_G, roi_B = R[y1:y2, x1:x2], G[y1:y2, x1:x2], B[y1:y2, x1:x2]
+        h, w = final_rgb.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Handle lasso (free‑form polygon)
+        if lasso_raw:
+            pts = np.array(list(zip(lasso_raw[0]["x"], lasso_raw[0]["y"]))).astype(np.int32)
+
+            if HAS_OPENCV:
+                cv2.fillPoly(mask, [pts], 1)
+            else:  # NumPy fallback if OpenCV missing
+                from matplotlib.path import Path
+                yy, xx = np.mgrid[:h, :w]
+                coords = np.vstack((xx.ravel(), yy.ravel())).T
+                mask = Path(pts).contains_points(coords).reshape(h, w).astype(np.uint8)
+
+        # Handle simple box selection
+        elif box_raw:
+            xs = box_raw[0]["x"]
+            ys = box_raw[0]["y"]
+            x0, x1 = int(min(xs)), int(max(xs))
+            y0, y1 = int(min(ys)), int(max(ys))
+            mask[y0:y1, x0:x1] = 1
+
+        if mask.sum() == 0:
+            st.warning("ROI mask is empty – try drawing a larger area.")
+            return final_rgb
+
+        # --- Visual overlay -----------------------------------------
+        overlay = final_rgb.copy()
+        overlay[mask == 1] = (
+            overlay[mask == 1].astype(np.float32) * 0.4 + np.array([255, 0, 0]) * 0.6
+        ).astype(np.uint8)
+        st.image(overlay, caption="ROI overlay", use_container_width=True)
+
+        # --- Metric calculations ------------------------------------
+        R = self.processed_channels["R"]
+        G = self.processed_channels["G"]
+        B = self.processed_channels["B"]
+
+        roi_R, roi_G, roi_B = R[mask == 1], G[mask == 1], B[mask == 1]
 
         chan_map = self.params.channel_map
-        raw_roi_LWP = self.raw_bands[chan_map['R']][y1:y2, x1:x2]
-        raw_roi_BP  = self.raw_bands[chan_map['G']][y1:y2, x1:x2]
-        raw_roi_SWP = self.raw_bands[chan_map['B']][y1:y2, x1:x2]
+        raw_lwp = self.raw_bands[chan_map["R"]][mask == 1]
+        raw_bp  = self.raw_bands[chan_map["G"]][mask == 1]
+        raw_swp = self.raw_bands[chan_map["B"]][mask == 1]
 
-        # Calculate and Display Stats
-        def get_stats(a: np.ndarray) -> Dict[str, float]:
+        def _stats(a):
             return {
-                "mean": float(a.mean()), "median": float(np.median(a)),
-                "min": float(a.min()), "max": float(a.max()),
-                "std": float(a.std())
+                "mean": float(a.mean()),
+                "median": float(np.median(a)),
+                "min": float(a.min()),
+                "max": float(a.max()),
+                "std": float(a.std()),
             }
 
-        st.write("Post-Stretch ROI Channel Stats")
-        df = pd.DataFrame([get_stats(roi_R), get_stats(roi_G), get_stats(roi_B)], index=["R", "G", "B"])
-        st.dataframe(df.style.format("{:.2f}"))
+        st.write("Post-stretch ROI channel stats")
+        st.dataframe(
+            pd.DataFrame(
+                [_stats(roi_R), _stats(roi_G), _stats(roi_B)],
+                index=["R", "G", "B"],
+            ).style.format("{:.2f}")
+        )
 
-        with st.expander("Raw Pre-Stretch ROI Channel Stats"):
-            df_raw = pd.DataFrame([
-                get_stats(raw_roi_LWP), get_stats(raw_roi_BP), get_stats(raw_roi_SWP)
-            ], index=["LWP_raw", "BP_raw", "SWP_raw"])
-            st.dataframe(df_raw.style.format("{:.2f}"))
-
-        metrics = self._calculate_roi_metrics(roi_R.mean(), roi_G.mean(), roi_B.mean(), raw_roi_LWP, raw_roi_BP, raw_roi_SWP)
-        st.write("ROI Metrics")
-        st.dataframe(pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"]).style.format("{:.4f}"))
+        metrics = self._calculate_roi_metrics(
+            roi_R.mean(), roi_G.mean(), roi_B.mean(), raw_lwp, raw_bp, raw_swp
+        )
+        st.write("ROI metrics")
+        st.dataframe(
+            pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"]).style.format("{:.4f}")
+        )
 
         suggestion = _suggest_pigment(metrics)
         st.write(f"**Heuristic pigment match:** {suggestion}")
 
-        # ... (ROI saving logic is unchanged)
-        self._handle_roi_saving(metrics, (x1, y1, x2, y2), roi_R, roi_G, roi_B, raw_roi_LWP, raw_roi_BP, raw_roi_SWP)
+        # --- Option to save ROI -------------------------------------
+        if st.button("Save ROI"):
+            new_roi = {
+                "label": f"ROI-{len(st.session_state['rois']) + 1}",
+                "pixels": int(mask.sum()),
+                "R_mean": float(roi_R.mean()),
+                "G_mean": float(roi_G.mean()),
+                "B_mean": float(roi_B.mean()),
+            }
+            new_roi.update(metrics)
+            st.session_state["rois"].append(new_roi)
+            st.toast("ROI saved!")
 
-        display_rgb = self._draw_roi_boxes(final_rgb.copy(), (x1, y1, x2, y2))
-        return display_rgb
+        return overlay
 
     def _white_patch_picker(self, img: np.ndarray) -> None:
         """Interactive white-patch picker using streamlit-image-coordinates if available.
@@ -975,42 +1086,36 @@ class FalseColourApp:
         df_sample = df_sample.copy()
         df_sample['__orig_index__'] = df_sample.index.values
 
-        fig = px.scatter(
-            df_sample,
-            x=x_axis,
-            y=y_axis,
-            color=color_axis,
-            opacity=0.6,
-            title=f"{x_axis} vs {y_axis}",
-            height=600,
-            custom_data=['__orig_index__']
-        )
+        fig = px.scatter(df_sample, x=x_axis, y=y_axis, color=color_axis, opacity=0.6, title=f"{x_axis} vs {y_axis}", height=600, custom_data=['__orig_index__'])
         fig.update_layout(dragmode='lasso', hovermode='closest')
-        # Ensure markers are visible
-        fig.update_traces(marker=dict(size=4), selector=dict(mode='markers'))
+        st.plotly_chart(fig, use_container_width=True, key="pca_plot")
 
-        # --- Render scatter plot ---
-        st.plotly_chart(fig, use_container_width=True, key="pca_chart")
+        # Retrieve lasso/box selection sent back from the Plotly component.
+        # Streamlit (v1.30+) uses the key "selectedData"; older builds exposed
+        # "selection" or "select". We probe them in order of preference.
+        state = st.session_state.get("pca_plot", {})
+        original_indices = np.array([], dtype=int)
 
-        # --- Optional lasso selection via streamlit‑plotly‑events ---
-        selected_points = []
-        if HAS_PLOTLY_EVENTS:
-            try:
-                selected_points = plotly_events(
-                    fig,
-                    click_event=False,
-                    select_event=True,
-                    key="pca_plot",
-                    override_height=600
-                )
-            except Exception as e:
-                st.warning(f"Lasso selection disabled (plotly‑events error: {e})")
+        if isinstance(state, dict):
+            sel = (
+                state.get("selectedData")  # current key (Streamlit >=1.30)
+                or state.get("selection")  # very early internal builds
+                or state.get("select")     # rare alias
+                or state.get("last_selection")  # experimental API
+                or {}
+            )
+            if isinstance(sel, dict) and sel.get("points"):
+                pts = sel["points"]
+                # Each point should carry our custom index in `customdata`
+                try:
+                    original_indices = np.asarray(
+                        [int(p["customdata"][0]) for p in pts if p.get("customdata")]
+                    )
+                except Exception:
+                    original_indices = np.array([], dtype=int)
 
-        # If no points selected, stop here (still showing the plot above)
-        if not selected_points:
+        if original_indices.size == 0:
             return
-        # Extract original pixel indices from selection
-        original_indices = np.array([int(p["customdata"][0]) for p in selected_points])
 
         # Shared variables for both tabs
         chan_map = self.params.channel_map
@@ -1022,12 +1127,7 @@ class FalseColourApp:
             lwp_mean = self.raw_bands[chan_map['R']][rows, cols].mean()
             bp_mean  = self.raw_bands[chan_map['G']][rows, cols].mean()
             swp_mean = self.raw_bands[chan_map['B']][rows, cols].mean()
-            spec_fig = px.bar(
-                x=['LWP', 'BP', 'SWP'],
-                y=[lwp_mean, bp_mean, swp_mean],
-                labels={'x': 'Band', 'y': 'Mean Raw Value'},
-                title="Mean Signature"
-            )
+            spec_fig = px.bar(x=['LWP', 'BP', 'SWP'], y=[lwp_mean, bp_mean, swp_mean], labels={'x': 'Band', 'y': 'Mean Raw Value'}, title="Mean Signature")
             st.plotly_chart(spec_fig, use_container_width=True)
 
         with tab_overlay:
