@@ -49,7 +49,6 @@ except Exception:  # pragma: no cover
 
 # --- Constants ---
 EPSILON = np.finfo(float).eps
-ECC_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-5) if HAS_OPENCV else None
 
 # Pre-defined heuristic pigment signatures for suggestive matching.
 # Inspired by the goal of the paper to differentiate pigments.
@@ -460,11 +459,13 @@ class FalseColourApp:
     def _generate_ratio_composite(self):
         """Builds a 3-channel ratio composite based on the selected formula."""
         formula = self.params.ratio_opts.formula
-        R, G, B = [self.processed_channels[c].astype(np.float32) for c in ['R', 'G', 'B']]
-        raw_bp, raw_swp = self.raw_bands[self.params.channel_map['G']], self.raw_bands[self.params.channel_map['B']]
-
+        # Use raw source bands for ratio calculation for consistency
+        R, G, B = [self.source_bands[c].astype(np.float32) for c in ['R', 'G', 'B']]
+        
         if formula.startswith("Default"):
-            channels = [_safe_divide(R, G), _safe_divide(B, R), _safe_divide(raw_swp - raw_bp, raw_swp + raw_bp)]
+            # The default formula uses a mix of processed and raw in the original paper's spirit
+            # For consistency here, we use the source bands (equivalent to raw LWP, BP, SWP)
+            channels = [_safe_divide(R, G), _safe_divide(B, R), _safe_divide(B - G, B + G)]
         elif formula.startswith("Alt1"):
             channels = [_safe_divide(R, G + B), _safe_divide(G, R + B), _safe_divide(B, R + G)]
         else: # Alt2
@@ -489,19 +490,20 @@ class FalseColourApp:
         x1, x2 = st.slider("X range", 0, w-1, (int(w*0.25), int(w*0.75)))
         y1, y2 = st.slider("Y range", 0, h-1, (int(h*0.25), int(h*0.75)))
         
-        roi_R, roi_G, roi_B = [self.processed_channels[c][y1:y2, x1:x2] for c in ['R', 'G', 'B']]
+        # Get both processed channels (for preview) and raw source bands (for metrics)
+        roi_R_processed, roi_G_processed, roi_B_processed = [self.processed_channels[c][y1:y2, x1:x2] for c in ['R', 'G', 'B']]
         raw_roi_bands = {k: v[y1:y2, x1:x2] for k, v in self.source_bands.items()}
 
-        st.write("Post-Stretch ROI Channel Stats")
-        df = pd.DataFrame([{"mean":a.mean(), "std":a.std()} for a in [roi_R, roi_G, roi_B]], index=["R", "G", "B"])
+        st.write("Post-Stretch ROI Channel Stats (for appearance only)")
+        df = pd.DataFrame([{"mean":a.mean(), "std":a.std()} for a in [roi_R_processed, roi_G_processed, roi_B_processed]], index=["R", "G", "B"])
         st.dataframe(df.style.format("{:.2f}"))
 
-        metrics = self._calculate_roi_metrics(roi_R.mean(), roi_G.mean(), roi_B.mean(), **raw_roi_bands)
-        st.write("ROI Metrics")
+        metrics = self._calculate_roi_metrics(**raw_roi_bands)
+        st.write("ROI Metrics (calculated from raw data)")
         st.dataframe(pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"]).style.format("{:.4f}"))
         st.write(f"**Heuristic pigment match:** { _suggest_pigment(metrics)}")
 
-        self._handle_roi_saving(metrics, (x1, y1, x2, y2), roi_R, roi_G, roi_B, **raw_roi_bands)
+        self._handle_roi_saving(metrics, (x1, y1, x2, y2), **raw_roi_bands)
         return self._draw_roi_boxes(final_rgb.copy(), (x1, y1, x2, y2))
 
     def _white_patch_picker(self, img: np.ndarray) -> None:
@@ -521,25 +523,27 @@ class FalseColourApp:
             self.white_patch_coords = (x1, y1, x2, y2)
             st.success(f"White patch set to: x=[{x1},{x2}), y=[{y1},{y2}). Re-run to apply.")
 
-    def _calculate_roi_metrics(self, rm, gm, bm, R, G, B) -> Dict[str, float]:
-        """Calculates a set of useful metrics for a given ROI's mean values and raw bands."""
+    def _calculate_roi_metrics(self, R: np.ndarray, G: np.ndarray, B: np.ndarray) -> Dict[str, float]:
+        """Calculates a set of useful metrics for a given ROI's raw source bands."""
         metrics = {}
+        raw_r_mean, raw_g_mean, raw_b_mean = R.mean(), G.mean(), B.mean()
+
         def safe_metric(name, func):
             try: metrics[name] = float(func())
             except Exception: metrics[name] = np.nan
-        safe_metric("R/G", lambda: _safe_divide(rm, gm))
-        safe_metric("B/R", lambda: _safe_divide(bm, rm))
+        
+        safe_metric("R/G", lambda: _safe_divide(raw_r_mean, raw_g_mean))
+        safe_metric("B/R", lambda: _safe_divide(raw_b_mean, raw_r_mean))
         safe_metric("(SWP-BP)/(SWP+BP)", lambda: np.mean(_safe_divide(B - G, B + G)))
         safe_metric("(LWP-BP)/(LWP+BP)", lambda: np.mean(_safe_divide(R - G, R + G)))
         return metrics
     
-    def _handle_roi_saving(self, metrics, coords, r_roi, g_roi, b_roi, R, G, B):
+    def _handle_roi_saving(self, metrics, coords, R, G, B):
         """Manages the UI for saving and clearing ROIs."""
         c1, c2, c3 = st.columns([2, 1, 1])
         roi_label = c1.text_input("ROI label", f"ROI-{len(st.session_state['rois'])+1}")
         if c2.button("Save ROI"):
             new_roi = {"label": roi_label, "x1": coords[0], "y1": coords[1], "x2": coords[2], "y2": coords[3],
-                       "R_mean": r_roi.mean(), "G_mean": g_roi.mean(), "B_mean": b_roi.mean(),
                        "LWP_raw_mean": R.mean(), "BP_raw_mean": G.mean(), "SWP_raw_mean": B.mean()}
             st.session_state["rois"].append({**new_roi, **metrics})
             st.toast(f"Saved {roi_label}")
@@ -592,9 +596,8 @@ class FalseColourApp:
         results = []
         for c in np.unique(classes):
             mask = classes == c
-            r_m, g_m, b_m = [self.processed_channels[ch][mask].mean() for ch in ['R','G','B']]
             raw_bands = {k: v[mask] for k, v in self.source_bands.items()}
-            metrics = self._calculate_roi_metrics(r_m, g_m, b_m, **raw_bands)
+            metrics = self._calculate_roi_metrics(**raw_bands)
             results.append({"class": c, "pixels": mask.sum(), **metrics})
         df = pd.DataFrame(results).set_index("class")
         st.dataframe(df.style.format("{:.4f}"))
@@ -625,8 +628,10 @@ class FalseColourApp:
             return
 
         # Recover the original flattened pixel indices from the customdata field
-        original_indices = [p["customdata"] for p in sel["points"]]
-
+        # Plotly can wrap customdata in a list, so we robustly extract the first element.
+        point_data = [p["customdata"] for p in sel["points"]]
+        original_indices = [d[0] if isinstance(d, (list, np.ndarray)) else d for d in point_data]
+        
         h, w = display_rgb.shape[:2]
         rows, cols = np.unravel_index(original_indices, (h, w))
 
@@ -642,26 +647,60 @@ class FalseColourApp:
             st.image(overlay, use_container_width=True)
 
     def _run_batch_mode(self):
-        """Process triplets in alphabetical order and package results as a zip file."""
+        """Process triplets by detecting band names and package results as a zip file."""
         st.subheader("Batch mode results")
         names = sorted(self.raw_bands.keys())
-        if len(names) % 3 != 0: st.error("Batch mode expects a multiple of 3 files."); return
-        
+        if len(names) % 3 != 0:
+            st.error("Batch mode expects a multiple of 3 files.")
+            return
+
+        def find_band_in_triplet(keyword: str, triplet: List[str], used: set) -> Optional[str]:
+            """Finds a file in the triplet containing the keyword, ignoring used files."""
+            for name in triplet:
+                if keyword in name.lower() and name not in used:
+                    return name
+            # Fallback for cases where keywords are missing
+            for name in triplet:
+                if name not in used:
+                    return name
+            return None
+
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
             for i in range(0, len(names), 3):
-                t = names[i:i+3]
-                lwp, bp, swp = t[0], t[1], t[2] # Simple assumption
+                triplet = names[i:i + 3]
+                used_in_triplet = set()
+                
+                lwp = find_band_in_triplet('lwp', triplet, used_in_triplet)
+                if lwp: used_in_triplet.add(lwp)
+                
+                bp = find_band_in_triplet('bp', triplet, used_in_triplet)
+                if bp: used_in_triplet.add(bp)
+
+                swp = find_band_in_triplet('swp', triplet, used_in_triplet)
+                if swp: used_in_triplet.add(swp)
+                
+                if not all([lwp, bp, swp]):
+                    st.warning(f"Could not reliably map LWP/BP/SWP in triplet: {triplet}. Falling back to alphabetical order.")
+                    # Ensure we don't reuse files even in fallback
+                    remaining = [n for n in triplet if n not in {lwp, bp, swp}]
+                    if not lwp: lwp = remaining.pop(0)
+                    if not bp: bp = remaining.pop(0)
+                    if not swp: swp = remaining.pop(0)
+                
                 self.params.channel_map = {'R': lwp, 'G': bp, 'B': swp}
                 final_rgb = self._process_image()
                 
                 buf = io.BytesIO()
                 Image.fromarray(final_rgb).save(buf, format="PNG")
-                zf.writestr(f"composite_{i//3 + 1}.png", buf.getvalue())
+                # Create a more descriptive filename for the zip archive
+                base_name = lwp.split('.')[0].replace("_lwp", "").replace("_LWP", "")
+                zf.writestr(f"composite_{base_name}.png", buf.getvalue())
                 
-                st.image(final_rgb, caption=f"Composite for: {', '.join(t)}", use_container_width=True)
-        
+                st.image(final_rgb, caption=f"Composite for: {', '.join(triplet)}", use_container_width=True)
+
         st.download_button("Download All Composites (ZIP)", zbuf.getvalue(), "batch_composites.zip", "application/zip")
+
 
     # ----------------------------- Main Execution -----------------------------
     def run(self):
