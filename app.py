@@ -13,6 +13,17 @@ import plotly.express as px
 import textwrap
 from sklearn.decomposition import PCA
 
+# --- Helper: percentile stretch and gamma correction ---
+def stretch_and_gamma(arr: np.ndarray, low_p: float, high_p: float, gamma: float) -> np.ndarray:
+    """
+    Percentile-based stretch and optional gamma correction.
+    """
+    lo, hi = np.percentile(arr, (low_p, high_p))
+    arr_clipped = np.clip((arr - lo) / (hi - lo + EPSILON), 0, 1)
+    if gamma != 1.0:
+        arr_clipped = np.power(arr_clipped, 1.0 / gamma)
+    return (arr_clipped * 255.0).astype(np.uint8)
+
 # --- Optional: capture Plotly lasso selections via streamlit-plotly-events ---
 try:
     from streamlit_plotly_events import plotly_events
@@ -322,17 +333,30 @@ class FalseColourApp:
         """
         Apply percentile-based stretch and gamma correction to an array.
         """
-        # Compute lower and upper percentile values
-        lo, hi = np.percentile(arr, (low_p, high_p))
-        # Clip to the percentile range
-        arr_clipped = np.clip(arr, lo, hi)
-        # Scale to 0-255 range
-        scale = 255.0 / (hi - lo + EPSILON)
-        stretched = (arr_clipped - lo) * scale
-        # Apply gamma correction if needed
-        if gamma != 1.0:
-            stretched = np.power(stretched / 255.0, 1.0 / gamma) * 255.0
-        return stretched.astype(np.uint8)
+        return stretch_and_gamma(arr, low_p, high_p, gamma)
+
+    def _compute_gains(self, R: np.ndarray, G: np.ndarray, B: np.ndarray) -> list:
+        """
+        Compute color balance gains based on white patch, auto-balance, or manual gains.
+        """
+        if self.white_patch_enabled and self.white_patch_coords is not None:
+            x1, y1, x2, y2 = self.white_patch_coords
+            ref_means = {
+                'R': float(R[y1:y2, x1:x2].mean()),
+                'G': float(G[y1:y2, x1:x2].mean()),
+                'B': float(B[y1:y2, x1:x1+0].mean())  # B uses same coords
+            }
+            target = np.mean(list(ref_means.values()))
+            return [
+                _safe_divide(target, ref_means['R']),
+                _safe_divide(target, ref_means['G']),
+                _safe_divide(target, ref_means['B']),
+            ]
+        if self.params.auto_balance:
+            means = [float(R.mean()), float(G.mean()), float(B.mean())]
+            target = np.mean([m for m in means if m > EPSILON])
+            return [target / (m + EPSILON) for m in means]
+        return self.params.gains or [1.0, 1.0, 1.0]
     # ------------------------------ UI --------------------------------
     def _setup_sidebar(self):
         st.sidebar.header("1. Upload Bands")
@@ -509,27 +533,7 @@ class FalseColourApp:
 
         # Step 3: Color balance
         R, G, B = stretched_channels['R'], stretched_channels['G'], stretched_channels['B']
-        gains = [1.0, 1.0, 1.0]
-        if self.white_patch_enabled and self.white_patch_coords is not None:
-            x1, y1, x2, y2 = self.white_patch_coords
-            ref_means = {
-                'R': float(R[y1:y2, x1:x2].mean()),
-                'G': float(G[y1:y2, x1:x2].mean()),
-                'B': float(B[y1:y2, x1:x2].mean()),
-            }
-            target_mean = np.mean(list(ref_means.values()))
-            gains = [
-                _safe_divide(target_mean, ref_means['R']),
-                _safe_divide(target_mean, ref_means['G']),
-                _safe_divide(target_mean, ref_means['B']),
-            ]
-        elif self.params.auto_balance:
-            means = [R.mean(), G.mean(), B.mean()]
-            target_mean = np.mean([m for m in means if m > EPSILON])
-            gains = [target_mean / (m + EPSILON) for m in means]
-        else:
-            gains = self.params.gains if self.params.gains is not None else [1.0, 1.0, 1.0]
-
+        gains = self._compute_gains(R, G, B)
         R = np.clip(R.astype(np.float32) * gains[0], 0, 255).astype(np.uint8)
         G = np.clip(G.astype(np.float32) * gains[1], 0, 255).astype(np.uint8)
         B = np.clip(B.astype(np.float32) * gains[2], 0, 255).astype(np.uint8)
@@ -560,6 +564,7 @@ class FalseColourApp:
             
         return rgb
     
+    @st.cache_data(show_spinner=False)
     def _generate_pca_composite(self):
         """Calculates and stores the PCA components and the PCA RGB helper image."""
         # Build data matrix and apply PCA via scikit-learn
@@ -603,6 +608,7 @@ class FalseColourApp:
         ])
 
 
+    @st.cache_data(show_spinner=False)
     def _generate_ratio_composite(self):
         """Builds a 3-channel ratio composite:
         R = R/G, G = B/R (using processed channels), B = (SWP-BP)/(SWP+BP) (using raw bands).
@@ -645,30 +651,15 @@ class FalseColourApp:
         ro = self.params.ratio_opts
         lo_p, hi_p = ro.low * 100, ro.high * 100
 
-        def _stretch_ratio(arr):
-            lo, hi = np.percentile(arr, (lo_p, hi_p))
-            arr_clip = np.clip((arr - lo) / (hi - lo + EPSILON), 0, 1)
-            if ro.gamma != 1.0:
-                arr_clip = np.power(arr_clip, 1.0 / ro.gamma)
-            return arr_clip
-
-        ch_r = _stretch_ratio(ch_r)
-        ch_g = _stretch_ratio(ch_g)
-        ch_b = _stretch_ratio(ch_b)
+        ch_r = stretch_and_gamma((ch_r*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
+        ch_g = stretch_and_gamma((ch_g*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
+        ch_b = stretch_and_gamma((ch_b*255.0).astype(np.uint8), lo_p, hi_p, ro.gamma)
 
         # DEBUG: Print raw min/max for each channel before normalization
         for name, arr in [("R", ch_r), ("G", ch_g), ("B", ch_b)]:
             st.write(f"🔍 {name} channel before norm: min={float(np.nanmin(arr)):.4f}, max={float(np.nanmax(arr)):.4f}")
 
-        def norm8(x: np.ndarray) -> np.uint8:
-            x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            mn, mx = x.min(), x.max()
-            if mx - mn <= EPSILON:
-                return np.zeros_like(x, dtype=np.uint8)
-            x = (x - mn) / (mx - mn)
-            return (x * 255).astype(np.uint8)
-
-        self.ratio_rgb = np.dstack([norm8(ch_r), norm8(ch_g), norm8(ch_b)])
+        self.ratio_rgb = np.dstack([ch_r, ch_g, ch_b])
 
 
     def _display_roi_analysis(self, final_rgb: np.ndarray) -> np.ndarray:
