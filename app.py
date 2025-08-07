@@ -361,7 +361,10 @@ class FalseColourApp:
         with st.sidebar.expander("Color Balance", expanded=True):
             self.params.auto_balance = st.checkbox("Apply gray-world balance", value=True)
             if not self.params.auto_balance and not self.white_patch_enabled:
-                r_gain, g_gain, b_gain = st.slider("RGB gains", 0.1, 3.0, (1.0, 1.0, 1.0), 0.01)
+                c1, c2, c3 = st.columns(3)
+                r_gain = c1.slider("R gain", 0.1, 3.0, 1.0, 0.01)
+                g_gain = c2.slider("G gain", 0.1, 3.0, 1.0, 0.01)
+                b_gain = c3.slider("B gain", 0.1, 3.0, 1.0, 0.01)
                 self.params.gains = [r_gain, g_gain, b_gain]
 
         with st.sidebar.expander("Advanced Processing Tools", expanded=False):
