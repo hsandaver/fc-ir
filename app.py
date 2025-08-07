@@ -994,24 +994,25 @@ class FalseColourApp:
             opacity=0.6,
             title=f"{x_axis} vs {y_axis}",
             height=600,
-            custom_data=['__orig_index__'],
-            render_mode='webgl'
+            custom_data=['__orig_index__']
         )
         fig.update_layout(dragmode='lasso', hovermode='closest')
+        # Ensure markers are visible
+        fig.update_traces(marker=dict(size=4), selector=dict(mode='markers'))
 
-        # --- Capture lasso selections using streamlit-plotly-events if available ---
+        # Display the scatter plot for selection
+        st.plotly_chart(fig, use_container_width=True, key="pca_plot")
+        # Capture lasso selection
         if not HAS_PLOTLY_EVENTS:
             st.info("Install `streamlit-plotly-events` to enable PCA lasso selection and overlay.")
             return
         selected_points = plotly_events(
             fig,
+            click_event=False,
             select_event=True,
-            key="pca_events",
-            override_height=600,
-            override_width="container"
+            key="pca_plot",
+            override_height=600
         )
-        st.write("DEBUG: number of selected_points:", len(selected_points) if selected_points is not None else None)
-        st.write("DEBUG: selected_points=", selected_points)
         if not selected_points:
             return
         # Extract original pixel indices from selection
