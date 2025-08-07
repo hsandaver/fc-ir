@@ -564,7 +564,6 @@ class FalseColourApp:
             
         return rgb
     
-    @st.cache_data(show_spinner=False)
     def _generate_pca_composite(self):
         """Calculates and stores the PCA components and the PCA RGB helper image."""
         # Build data matrix and apply PCA via scikit-learn
@@ -608,7 +607,6 @@ class FalseColourApp:
         ])
 
 
-    @st.cache_data(show_spinner=False)
     def _generate_ratio_composite(self):
         """Builds a 3-channel ratio composite:
         R = R/G, G = B/R (using processed channels), B = (SWP-BP)/(SWP+BP) (using raw bands).
