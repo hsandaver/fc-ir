@@ -11,3 +11,4 @@ rasterio
 tifffile
 packaging
 matplotlib
+tabulate>=0.8.10
