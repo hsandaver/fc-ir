@@ -51,6 +51,7 @@ PIGMENT_DB = [
     {"name": "Ultramarine", "metrics": {"R/G": 1.3, "B/R": 0.6, "(SWP-BP)/(SWP+BP)": 0.2}},
     {"name": "Azurite", "metrics": {"R/G": 0.8, "B/R": 1.1, "(SWP-BP)/(SWP+BP)": -0.1}},
     {"name": "Prussian blue", "metrics": {"R/G": 0.7, "B/R": 1.4, "(SWP-BP)/(SWP+BP)": -0.2}},
+    {"name": "Phthalo blue", "metrics": {"R/G": 1.1, "B/R": 0.9, "(SWP-BP)/(SWP+BP)": 0.15}},
 ]
 
 # -----------------------------------------------------------------------------
@@ -193,6 +194,10 @@ class AppParams:
     pca_opts: PCAOptions = field(default_factory=lambda: PCAOptions(map={"R": "PC1", "G": "PC2", "B": "PC3"}))
     make_ratio: bool = False
     ratio_opts: RatioOptions = field(default_factory=RatioOptions)
+    # --- NEW for pigment-oriented workflow ---
+    scientific_mode: bool = False          # Use reflectance-based processing for analysis
+    target_reflectance: float = 0.99       # Assumed reflectance of the reference tile/patch
+    enable_irfc: bool = False              # Optional VIS+NIR IRFC composer
 
 
 # -----------------------------------------------------------------------------
@@ -219,6 +224,12 @@ class FalseColourApp:
         self.flat_field: Optional[np.ndarray] = None
         self.white_patch_enabled: bool = False
         self.white_patch_coords: Optional[Tuple[int, int, int, int]] = None
+        # --- NEW state for scientific mode ---
+        self.refl_bands: Dict[str, np.ndarray] = {}
+        # IRFC inputs/outputs
+        self.irfc_vis_rgb: Optional[np.ndarray] = None
+        self.irfc_nir: Optional[np.ndarray] = None
+        self.irfc_rgb: Optional[np.ndarray] = None
 
     # ---------------------------- Alignment ----------------------------
 
@@ -282,6 +293,26 @@ class FalseColourApp:
             return mov
 
     def _apply_dark_flat_correction(self) -> None:
+    def _calibrate_to_reflectance(self) -> Dict[str, np.ndarray]:
+        """Approximate reflectance from corrected source bands using a white reference ROI.
+        Formula: refl ≈ I / I_white  (dark/flat already handled earlier). If no ROI is set,
+        falls back to global mean normalization.
+        Returns a dict of float32 arrays in [0, ~1+].
+        """
+        refl: Dict[str, np.ndarray] = {}
+        # Use ROI if provided
+        if self.white_patch_coords is not None:
+            x1, y1, x2, y2 = self.white_patch_coords
+        else:
+            x1 = y1 = 0
+            any_arr = next(iter(self.source_bands.values()))
+            y2, x2 = any_arr.shape
+        for k, arr in self.source_bands.items():
+            a = arr.astype(np.float32)
+            roi_mean = float(np.mean(a[y1:y2, x1:x2]) + EPSILON)
+            scale = self.params.target_reflectance / roi_mean
+            refl[k] = np.clip(a * scale, 0.0, None).astype(np.float32)
+        return refl
         """Apply optional dark-frame subtraction and flat-field division (normalized)."""
         if self.dark_frame is None and self.flat_field is None:
             return
@@ -336,6 +367,19 @@ class FalseColourApp:
     # ------------------------------ UI --------------------------------
     def _setup_sidebar(self):
         st.sidebar.header("1. Upload Bands")
+        # --- Modes ---
+        self.params.scientific_mode = st.sidebar.checkbox(
+            "Scientific (pigment) mode", value=self.params.scientific_mode,
+            help=(
+                "Processes on reflectance (using a white reference ROI) for PCA/ratios/SAM."
+                " Disables gray-world auto-balance and other display-only tweaks."
+            )
+        )
+        if self.params.scientific_mode:
+            self.params.target_reflectance = st.sidebar.slider(
+                "Target reflectance for white patch", 0.80, 1.00, self.params.target_reflectance, 0.01,
+                help="Approximate reflectance of the reference tile (e.g., Spectralon ≈0.99)."
+            )
         if version.parse(st.__version__) < version.parse("1.38.0"):
             st.sidebar.warning(
                 "⚠️ Please upgrade Streamlit to >=1.38.0 to avoid Plotly flicker issues",
@@ -395,6 +439,7 @@ class FalseColourApp:
 
         # --- White-patch calibration controls ---
         with st.sidebar.expander("White-patch calibration", expanded=False):
+            st.caption("In Scientific mode this ROI is used to scale bands to reflectance.")
             self.white_patch_enabled = st.checkbox("Enable white patch ROI calibration", value=False)
             if self.white_patch_enabled:
                 h, w = next(iter(self.raw_bands.values())).shape
@@ -481,6 +526,33 @@ class FalseColourApp:
                 rp_low, rp_high = st.slider("Ratio composite percentiles", 0.0, 1.0, (0.02, 0.98), 0.01)
                 r_gamma = st.slider("Ratio composite gamma", 0.10, 3.0, 1.0, 0.01)
                 self.params.ratio_opts = RatioOptions(formula=selected, low=rp_low, high=rp_high, gamma=r_gamma)
+            st.markdown("**IRFC composer (VIS+NIR)**")
+            self.params.enable_irfc = st.checkbox(
+                "Enable IRFC (VIS red→G, VIS green→B, NIR→R)", value=self.params.enable_irfc,
+                help="Create a classic IR false-colour composite from a visible RGB image plus a NIR band."
+            )
+            if self.params.enable_irfc:
+                vis_up = st.file_uploader("Visible RGB image (TIFF/PNG/JPG)", type=["tif","tiff","png","jpg","jpeg"], key="irfc_vis")
+                nir_up = st.file_uploader("NIR image (TIFF, mono)", type=["tif","tiff"], key="irfc_nir")
+                if vis_up is not None:
+                    try:
+                        vis_img = Image.open(vis_up).convert("RGB")
+                        self.irfc_vis_rgb = np.array(vis_img)
+                    except Exception as e:
+                        st.warning(f"Could not read VIS image: {e}")
+                if nir_up is not None:
+                    try:
+                        self.irfc_nir = _read_tiff(nir_up)
+                    except Exception as e:
+                        st.warning(f"Could not read NIR image: {e}")
+                # Optional resize of NIR to VIS
+                if (self.irfc_vis_rgb is not None) and (self.irfc_nir is not None):
+                    h, w = self.irfc_vis_rgb.shape[:2]
+                    if self.irfc_nir.shape != (h, w):
+                        if HAS_OPENCV:
+                            self.irfc_nir = cv2.resize(self.irfc_nir, (w, h), interpolation=cv2.INTER_LINEAR)
+                        else:
+                            self.irfc_nir = np.array(Image.fromarray(self.irfc_nir).resize((w, h)))
 
         st.session_state["pc_debug"] = st.sidebar.checkbox("Debug PCA/ratio internals", value=st.session_state["pc_debug"])
 
@@ -488,10 +560,7 @@ class FalseColourApp:
     def _process_image(self) -> np.ndarray:
         """
         Runs the full image processing pipeline based on user parameters.
-        This function is the core of the application's image manipulation logic.
-
-        Returns:
-            np.ndarray: The final, processed (H, W, 3) uint8 RGB image.
+        Returns (H, W, 3) uint8 RGB image for display. Analysis uses float `self.refl_bands` when `scientific_mode`.
         """
         # Step 1: Map uploaded files to bands
         try:
@@ -514,7 +583,6 @@ class FalseColourApp:
             else:
                 ref_key = self.params.align_ref
                 ref = self.source_bands[ref_key].astype(np.float32)
-                # Normalize to 0-255 uint8 for ECC stability
                 ref_norm = (ref - np.nanmin(ref)) / (np.nanmax(ref) - np.nanmin(ref) + EPSILON)
                 ref_u8 = np.clip(ref_norm * 255.0, 0, 255).astype(np.uint8)
                 for k in ["R", "G", "B"]:
@@ -524,104 +592,89 @@ class FalseColourApp:
                     mov_norm = (mov - np.nanmin(mov)) / (np.nanmax(mov) - np.nanmin(mov) + EPSILON)
                     mov_u8 = np.clip(mov_norm * 255.0, 0, 255).astype(np.uint8)
                     aligned_u8 = self._align_bands(ref_u8, mov_u8)
-                    # Rescale back to the original dynamic range of the moving band
                     mov_min, mov_max = float(np.nanmin(mov)), float(np.nanmax(mov))
                     self.source_bands[k] = aligned_u8.astype(np.float32) * ((mov_max - mov_min) / 255.0) + mov_min
 
-        # ... rest of the processing logic ...
-        # Step 1.5: Optional pre-stretch normalization
-        if self.params.pre_equalize:
-            means = {k: float(v.mean()) for k, v in self.source_bands.items()}
-            target_mean = np.mean(list(means.values()))
-            self.source_bands = {
-                k: v.astype(np.float32) * _safe_divide(target_mean, means[k])
-                for k, v in self.source_bands.items()
-            }
+        # Step 1.5: Prepare analysis bands
+        if self.params.scientific_mode:
+            # Reflectance calibration using ROI
+            self.refl_bands = self._calibrate_to_reflectance()
+        else:
+            # Optional pre-stretch normalization of raw bands for prettier display
+            if self.params.pre_equalize:
+                means = {k: float(v.mean()) for k, v in self.source_bands.items()}
+                target_mean = np.mean(list(means.values()))
+                self.source_bands = {k: v.astype(np.float32) * _safe_divide(target_mean, means[k]) for k, v in self.source_bands.items()}
+            # For non-scientific mode, analysis operates on these pre-normalized bands
+            self.refl_bands = {k: self.source_bands[k].astype(np.float32) for k in ["R","G","B"]}
 
-        # Step 2: Per-band stretch & gamma
+        # Step 2: Per-band stretch & gamma (for display only)
         stretched_channels = {}
         for chan in ['R', 'G', 'B']:
             p = self.params.stretch[chan]
-            stretched_channels[chan] = self._stretch_percentile_gamma(self.source_bands[chan], p[0], p[1], p[2])
+            src = self.refl_bands[chan] if self.params.scientific_mode else self.source_bands[chan]
+            stretched_channels[chan] = self._stretch_percentile_gamma(src, p[0], p[1], p[2])
 
         # Step 3: Color balance
         R, G, B = stretched_channels['R'], stretched_channels['G'], stretched_channels['B']
-        gains = [1.0, 1.0, 1.0]
-        if self.white_patch_enabled and self.white_patch_coords is not None:
-            x1, y1, x2, y2 = self.white_patch_coords
-            ref_means = {
-                'R': float(R[y1:y2, x1:x2].mean()),
-                'G': float(G[y1:y2, x1:x2].mean()),
-                'B': float(B[y1:y2, x1:x2].mean()),
-            }
-            target_mean = np.mean(list(ref_means.values()))
-            gains = [
-                _safe_divide(target_mean, ref_means['R']),
-                _safe_divide(target_mean, ref_means['G']),
-                _safe_divide(target_mean, ref_means['B']),
-            ]
-        elif self.params.auto_balance:
-            means = [R.mean(), G.mean(), B.mean()]
-            target_mean = np.mean([m for m in means if m > EPSILON])
-            gains = [target_mean / (m + EPSILON) for m in means]
+        if self.params.scientific_mode:
+            gains = [1.0, 1.0, 1.0]  # avoid altering relative reflectances
         else:
-            gains = self.params.gains if self.params.gains is not None else [1.0, 1.0, 1.0]
+            gains = [1.0, 1.0, 1.0]
+            if self.white_patch_enabled and self.white_patch_coords is not None:
+                x1, y1, x2, y2 = self.white_patch_coords
+                ref_means = {'R': float(R[y1:y2, x1:x2].mean()), 'G': float(G[y1:y2, x1:x2].mean()), 'B': float(B[y1:y2, x1:x2].mean())}
+                target_mean = np.mean(list(ref_means.values()))
+                gains = [_safe_divide(target_mean, ref_means['R']), _safe_divide(target_mean, ref_means['G']), _safe_divide(target_mean, ref_means['B'])]
+            elif self.params.auto_balance:
+                means = [R.mean(), G.mean(), B.mean()]
+                target_mean = np.mean([m for m in means if m > EPSILON])
+                gains = [target_mean / (m + EPSILON) for m in means]
+            else:
+                gains = self.params.gains if self.params.gains is not None else [1.0, 1.0, 1.0]
 
         R = np.clip(R.astype(np.float32) * gains[0], 0, 255).astype(np.uint8)
         G = np.clip(G.astype(np.float32) * gains[1], 0, 255).astype(np.uint8)
         B = np.clip(B.astype(np.float32) * gains[2], 0, 255).astype(np.uint8)
 
-        # Assert channel shape alignment
         if not (R.shape == G.shape == B.shape):
             st.error(f"Channel shape mismatch: R{R.shape}, G{G.shape}, B{B.shape}")
             st.stop()
-        logging.debug(f"Verified channel shapes: {R.shape}")
 
-        # Store post-gain channels for ROI stats
         self.processed_channels = {'R': R, 'G': G, 'B': B}
         rgb = np.dstack([R, G, B])
 
-        # Step 4: Optional PCA helper composite generation
+        # Step 4: Optional PCA/ratio based on analysis bands (reflectance in scientific mode)
         if self.params.make_pca_helper:
             self._generate_pca_composite()
-
-        # Optional Ratio Composite
         if self.params.make_ratio:
             self._generate_ratio_composite()
 
-        # Step 5: Optional advanced final tweaks
+        # Step 5: Optional display tweaks
         if self.params.use_decor:
             rgb = self._decorrelation_stretch(rgb)
         if self.params.saturation != 1.0:
             rgb = self._boost_saturation(rgb, self.params.saturation)
-            
         return rgb
     
     def _generate_pca_composite(self):
-        """Calculates and stores the PCA components and the PCA RGB helper image."""
-        # Build data matrix and apply PCA via scikit-learn
-        stack = np.dstack([
-            self.source_bands['R'],
-            self.source_bands['G'],
-            self.source_bands['B']
-        ]).astype(np.float32)
+        """Calculates PCA components and PCA RGB helper image.
+        Uses reflectance-calibrated bands in scientific mode to avoid DN-driven artifacts.
+        """
+        # Choose source
+        band_src = self.refl_bands if (self.params.scientific_mode and self.refl_bands) else self.source_bands
+        stack = np.dstack([band_src['R'], band_src['G'], band_src['B']]).astype(np.float32)
         h, w, _ = stack.shape
         X = stack.reshape(-1, 3)
-        # Center and run PCA with optional whitening
         X_centered = X - X.mean(axis=0)
         pca = PCA(n_components=3, whiten=self.params.pca_opts.whiten)
         Y = pca.fit_transform(X_centered)
         self.pca_explained = pca.explained_variance_ratio_
-
-        # Reshape per-component images
         pcs = [Y[:, i].reshape(h, w) for i in range(3)]
-
-        # Scale components for visualization
         opts = self.params.pca_opts
-        scale_mode = opts.scale_mode
         scaled_pcs = []
         for comp in pcs:
-            if scale_mode == 'zscore':
+            if opts.scale_mode == 'zscore':
                 mean, std = comp.mean(), comp.std() + EPSILON
                 comp_norm = np.clip((comp - mean) / (3 * std), -1, 1)
                 comp_norm = (comp_norm + 1) / 2.0
@@ -629,76 +682,64 @@ class FalseColourApp:
                 comp_norm = (comp - comp.min()) / (comp.max() - comp.min() + EPSILON)
             scaled_pcs.append((comp_norm * 255).astype(np.uint8))
         self.pca_components = scaled_pcs
-
-        # Map scaled components to RGB channels
-        mapping = opts.map
         idx_map = {'PC1': 0, 'PC2': 1, 'PC3': 2}
         self.pca_rgb = np.dstack([
-            scaled_pcs[idx_map[mapping['R']]],
-            scaled_pcs[idx_map[mapping['G']]],
-            scaled_pcs[idx_map[mapping['B']]],
+            scaled_pcs[idx_map[opts.map['R']]],
+            scaled_pcs[idx_map[opts.map['G']]],
+            scaled_pcs[idx_map[opts.map['B']]],
         ])
 
 
     def _generate_ratio_composite(self):
-        """Builds a 3-channel ratio composite:
-        R = R/G, G = B/R (using processed channels), B = (SWP-BP)/(SWP+BP) (using raw bands).
-        Each channel is independently normalized to 0-255.
+        """Builds a 3-channel ratio composite on appropriate domain:
+        - Scientific mode: ratios from reflectance bands.
+        - Otherwise: keeps legacy behavior (post-stretch/per-band domain).
         """
-        # Allow different ratio formulas
         formula = self.params.ratio_opts.formula
-        # DEBUG: Show selected formula and channel ranges
-        import streamlit as st
         if st.session_state.get("pc_debug", False):
             st.write(f"🔧 Ratio formula: {formula}")
-        # Define raw bands for SWP and BP
-        chan_map = self.params.channel_map
-        raw_bp = self.raw_bands[chan_map['G']].astype(np.float32)
-        raw_swp = self.raw_bands[chan_map['B']].astype(np.float32)
-        if formula.startswith("Default"):
-            ch_r = _safe_divide(self.processed_channels['R'].astype(np.float32), self.processed_channels['G'].astype(np.float32))
-            ch_g = _safe_divide(self.processed_channels['B'].astype(np.float32), self.processed_channels['R'].astype(np.float32))
-            ch_b = _safe_divide(raw_swp - raw_bp, raw_swp + raw_bp)
-        elif formula.startswith("Alt1"):
-            R = self.processed_channels['R'].astype(np.float32)
-            G = self.processed_channels['G'].astype(np.float32)
-            B = self.processed_channels['B'].astype(np.float32)
-            ch_r = _safe_divide(R, G + B)
-            ch_g = _safe_divide(G, R + B)
-            ch_b = _safe_divide(B, R + G)
-        elif formula.startswith("Alt2"):
-            R = self.processed_channels['R'].astype(np.float32)
-            G = self.processed_channels['G'].astype(np.float32)
-            B = self.processed_channels['B'].astype(np.float32)
-            ch_r = _safe_divide(R - G, R + G)
-            ch_g = _safe_divide(G - B, G + B)
-            ch_b = _safe_divide(B - R, B + R)
+        # Select band source
+        if self.params.scientific_mode and self.refl_bands:
+            Rb = self.refl_bands['R'].astype(np.float32)
+            Gb = self.refl_bands['G'].astype(np.float32)
+            Bb = self.refl_bands['B'].astype(np.float32)
         else:
-            # Fallback to default
-            ch_r = _safe_divide(self.processed_channels['R'].astype(np.float32), self.processed_channels['G'].astype(np.float32))
-            ch_g = _safe_divide(self.processed_channels['B'].astype(np.float32), self.processed_channels['R'].astype(np.float32))
+            Rb = self.processed_channels['R'].astype(np.float32)
+            Gb = self.processed_channels['G'].astype(np.float32)
+            Bb = self.processed_channels['B'].astype(np.float32)
+        # Map SWP/BP to current G/B channels
+        raw_bp = Gb
+        raw_swp = Bb
+        if formula.startswith("Default"):
+            ch_r = _safe_divide(Rb, Gb)            # R/G
+            ch_g = _safe_divide(Bb, Rb)            # B/R
+            ch_b = _safe_divide(raw_swp - raw_bp, raw_swp + raw_bp)  # (SWP-BP)/(SWP+BP)
+        elif formula.startswith("Alt1"):
+            ch_r = _safe_divide(Rb, Gb + Bb)
+            ch_g = _safe_divide(Gb, Rb + Bb)
+            ch_b = _safe_divide(Bb, Rb + Gb)
+        elif formula.startswith("Alt2"):
+            ch_r = _safe_divide(Rb - Gb, Rb + Gb)
+            ch_g = _safe_divide(Gb - Bb, Gb + Bb)
+            ch_b = _safe_divide(Bb - Rb, Bb + Rb)
+        else:
+            ch_r = _safe_divide(Rb, Gb)
+            ch_g = _safe_divide(Bb, Rb)
             ch_b = _safe_divide(raw_swp - raw_bp, raw_swp + raw_bp)
-
-        # Apply user-defined percentile clipping and gamma to ratio channels
         ro = self.params.ratio_opts
         lo_p, hi_p = ro.low * 100, ro.high * 100
-
         def _stretch_ratio(arr):
             lo, hi = np.percentile(arr, (lo_p, hi_p))
             arr_clip = np.clip((arr - lo) / (hi - lo + EPSILON), 0, 1)
             if ro.gamma != 1.0:
                 arr_clip = np.power(arr_clip, 1.0 / ro.gamma)
             return arr_clip
-
         ch_r = _stretch_ratio(ch_r)
         ch_g = _stretch_ratio(ch_g)
         ch_b = _stretch_ratio(ch_b)
-
-        # DEBUG: Print raw min/max for each channel before normalization
-        for name, arr in [("R", ch_r), ("G", ch_g), ("B", ch_b)]:
-            if st.session_state.get("pc_debug", False):
+        if st.session_state.get("pc_debug", False):
+            for name, arr in [("R", ch_r), ("G", ch_g), ("B", ch_b)]:
                 st.write(f"🔍 {name} channel before norm: min={float(np.nanmin(arr)):.4f}, max={float(np.nanmax(arr)):.4f}")
-
         def norm8(x: np.ndarray) -> np.uint8:
             x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
             mn, mx = x.min(), x.max()
@@ -706,7 +747,6 @@ class FalseColourApp:
                 return np.zeros_like(x, dtype=np.uint8)
             x = (x - mn) / (mx - mn)
             return (x * 255).astype(np.uint8)
-
         self.ratio_rgb = np.dstack([norm8(ch_r), norm8(ch_g), norm8(ch_b)])
 
 
@@ -776,40 +816,32 @@ class FalseColourApp:
 
         roi_R, roi_G, roi_B = R[mask == 1], G[mask == 1], B[mask == 1]
 
+        # Reflectance domain for metrics (prefer reflectance if available)
+        ref_R = self.refl_bands.get('R', R.astype(np.float32))
+        ref_G = self.refl_bands.get('G', G.astype(np.float32))
+        ref_B = self.refl_bands.get('B', B.astype(np.float32))
+        roi_rR, roi_rG, roi_rB = ref_R[mask == 1], ref_G[mask == 1], ref_B[mask == 1]
+
         chan_map = self.params.channel_map
         raw_lwp = self.raw_bands[chan_map["R"]][mask == 1]
         raw_bp  = self.raw_bands[chan_map["G"]][mask == 1]
         raw_swp = self.raw_bands[chan_map["B"]][mask == 1]
 
         def _stats(a):
-            return {
-                "mean": float(a.mean()),
-                "median": float(np.median(a)),
-                "min": float(a.min()),
-                "max": float(a.max()),
-                "std": float(a.std()),
-            }
+            return {"mean": float(a.mean()), "median": float(np.median(a)), "min": float(a.min()), "max": float(a.max()), "std": float(a.std())}
 
-        st.write("Post-stretch ROI channel stats")
-        st.dataframe(
-            pd.DataFrame(
-                [_stats(roi_R), _stats(roi_G), _stats(roi_B)],
-                index=["R", "G", "B"],
-            ).style.format("{:.2f}")
-        )
+        st.write("Post-stretch ROI channel stats (display domain)")
+        st.dataframe(pd.DataFrame([_stats(roi_R), _stats(roi_G), _stats(roi_B)], index=["R","G","B"]).style.format("{:.2f}"))
 
-        metrics = self._calculate_roi_metrics(
-            roi_R.mean(), roi_G.mean(), roi_B.mean(), raw_lwp, raw_bp, raw_swp
-        )
-        st.write("ROI metrics")
-        st.dataframe(
-            pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"]).style.format("{:.4f}")
-        )
+        # Metrics computed on reflectance domain for pigment logic
+        metrics = self._calculate_roi_metrics(float(roi_rR.mean()), float(roi_rG.mean()), float(roi_rB.mean()), raw_lwp, raw_bp, raw_swp)
+        st.write("ROI metrics (reflectance domain)")
+        st.dataframe(pd.DataFrame.from_dict(metrics, orient="index", columns=["Value"]).style.format("{:.4f}"))
 
         suggestion = _suggest_pigment(metrics)
         st.write(f"**Heuristic pigment match:** {suggestion}")
 
-        # --- Option to save ROI -------------------------------------
+        class_name = st.text_input("Optional class label for SAM (e.g., 'ultramarine')", value="")
         if st.button("Save ROI"):
             new_roi = {
                 "label": f"ROI-{len(st.session_state['rois']) + 1}",
@@ -817,10 +849,65 @@ class FalseColourApp:
                 "R_mean": float(roi_R.mean()),
                 "G_mean": float(roi_G.mean()),
                 "B_mean": float(roi_B.mean()),
+                "R_refl_mean": float(roi_rR.mean()),
+                "G_refl_mean": float(roi_rG.mean()),
+                "B_refl_mean": float(roi_rB.mean()),
+                "class_label": class_name.strip() or None,
             }
             new_roi.update(metrics)
             st.session_state["rois"].append(new_roi)
             st.toast("ROI saved!")
+    def _sam_classifier_ui(self, base_rgb: np.ndarray):
+        """Simple SAM classifier using saved ROI class prototypes on reflectance bands."""
+        st.subheader("SAM Classifier (reflectance)")
+        if not self.params.scientific_mode:
+            st.info("Enable Scientific (pigment) mode to classify on reflectance.")
+            return
+        if not self.refl_bands:
+            st.info("Reflectance bands are not available.")
+            return
+        rois = [r for r in st.session_state.get("rois", []) if r.get("class_label")]
+        if not rois:
+            st.info("Save at least one ROI with a class label to build prototypes.")
+            return
+        # Build class prototypes (mean reflectance vectors)
+        df = pd.DataFrame(rois)
+        grouped = df.groupby("class_label")[['R_refl_mean','G_refl_mean','B_refl_mean']].mean()
+        classes = list(grouped.index)
+        if len(classes) == 0:
+            st.info("No labeled classes available.")
+            return
+        P = grouped.values.astype(np.float32)  # (C,3)
+        # Stack image reflectance
+        Rb, Gb, Bb = self.refl_bands['R'].astype(np.float32), self.refl_bands['G'].astype(np.float32), self.refl_bands['B'].astype(np.float32)
+        H, W = Rb.shape
+        X = np.dstack([Rb, Gb, Bb]).reshape(-1, 3)  # (N,3)
+        # Compute spectral angles to prototypes
+        X_norm = np.linalg.norm(X, axis=1, keepdims=True) + EPSILON
+        P_norm = np.linalg.norm(P, axis=1, keepdims=True).T + EPSILON  # (1,C)
+        cosines = (X @ P.T) / (X_norm @ P_norm)
+        cosines = np.clip(cosines, -1.0, 1.0)
+        angles = np.arccos(cosines)  # (N,C)
+        labels_idx = np.argmin(angles, axis=1).reshape(H, W)
+        # Build a legend and overlay
+        palette = np.array([
+            [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255],
+            [128, 0, 0], [0, 128, 0], [0, 0, 128], [128, 128, 0]
+        ], dtype=np.uint8)
+        colors = palette[np.mod(labels_idx, len(palette))]
+        overlay = (0.5 * base_rgb + 0.5 * colors).astype(np.uint8)
+        st.image(overlay, caption="SAM class overlay", use_container_width=True)
+        # Class counts
+        unique, counts = np.unique(labels_idx, return_counts=True)
+        counts_map = {classes[i]: int(counts[j]) for j, i in enumerate(unique)}
+        st.write(pd.DataFrame.from_dict(counts_map, orient='index', columns=['pixels']))
+        # Downloads
+        try:
+            png = Image.fromarray(colors)
+            buf = io.BytesIO(); png.save(buf, format='PNG')
+            st.download_button("Download class map (PNG)", data=buf.getvalue(), file_name="sam_classes.png", mime="image/png")
+        except Exception:
+            pass
 
         return overlay
 
@@ -1188,6 +1275,9 @@ class FalseColourApp:
                 tabs_list.extend(["PC1", "PC2", "PC3"])
             tabs_list.append("PC1 Mask Builder")
             tabs_list.append("PCA Scatter Analysis")
+        if self.params.enable_irfc and (self.irfc_vis_rgb is not None) and (self.irfc_nir is not None):
+            tabs_list.append("IRFC (VIS+NIR)")
+        tabs_list.append("SAM Classifier")
         tabs = st.tabs(tabs_list)
         # Show the false colour and channels first
         tabs[0].image(display_rgb, caption="Processed false-colour composite", use_container_width=True)
@@ -1214,6 +1304,24 @@ class FalseColourApp:
             idx += 1
             with tabs[idx]:
                 self._display_pca_tabs(display_rgb)
+        # IRFC tab (if any)
+        if self.params.enable_irfc and (self.irfc_vis_rgb is not None) and (self.irfc_nir is not None):
+            irfc_idx = idx
+            with tabs[irfc_idx]:
+                nir_u8 = self._stretch_percentile_gamma(self.irfc_nir, 2, 98, 1.0)
+                vis = self.irfc_vis_rgb
+                # Map: IR->R, VIS R->G, VIS G->B
+                if vis.ndim != 3 or vis.shape[2] != 3:
+                    st.warning("Visible image must be RGB.")
+                else:
+                    irfc = np.dstack([nir_u8, vis[..., 0], vis[..., 1]]).astype(np.uint8)
+                    self.irfc_rgb = irfc
+                    st.image(irfc, caption="IR False-Colour (IR→R, VIS R→G, VIS G→B)", use_container_width=True)
+            idx += 1
+        # SAM Classifier tab
+        with tabs[idx]:
+            self._sam_classifier_ui(display_rgb)
+        idx += 1
         # Sidebar downloads
         st.sidebar.header("4. Download Results")
         pil_img = Image.fromarray(display_rgb)
