@@ -51,7 +51,6 @@ PIGMENT_DB = [
     {"name": "Ultramarine", "metrics": {"R/G": 1.3, "B/R": 0.6, "(SWP-BP)/(SWP+BP)": 0.2}},
     {"name": "Azurite", "metrics": {"R/G": 0.8, "B/R": 1.1, "(SWP-BP)/(SWP+BP)": -0.1}},
     {"name": "Prussian blue", "metrics": {"R/G": 0.7, "B/R": 1.4, "(SWP-BP)/(SWP+BP)": -0.2}},
-    {"name": "Phthalo blue", "metrics": {"R/G": 1.1, "B/R": 0.9, "(SWP-BP)/(SWP+BP)": 0.15}},
 ]
 
 # -----------------------------------------------------------------------------
