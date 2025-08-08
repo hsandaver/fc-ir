@@ -293,26 +293,6 @@ class FalseColourApp:
             return mov
 
     def _apply_dark_flat_correction(self) -> None:
-    def _calibrate_to_reflectance(self) -> Dict[str, np.ndarray]:
-        """Approximate reflectance from corrected source bands using a white reference ROI.
-        Formula: refl ≈ I / I_white  (dark/flat already handled earlier). If no ROI is set,
-        falls back to global mean normalization.
-        Returns a dict of float32 arrays in [0, ~1+].
-        """
-        refl: Dict[str, np.ndarray] = {}
-        # Use ROI if provided
-        if self.white_patch_coords is not None:
-            x1, y1, x2, y2 = self.white_patch_coords
-        else:
-            x1 = y1 = 0
-            any_arr = next(iter(self.source_bands.values()))
-            y2, x2 = any_arr.shape
-        for k, arr in self.source_bands.items():
-            a = arr.astype(np.float32)
-            roi_mean = float(np.mean(a[y1:y2, x1:x2]) + EPSILON)
-            scale = self.params.target_reflectance / roi_mean
-            refl[k] = np.clip(a * scale, 0.0, None).astype(np.float32)
-        return refl
         """Apply optional dark-frame subtraction and flat-field division (normalized)."""
         if self.dark_frame is None and self.flat_field is None:
             return
@@ -342,6 +322,27 @@ class FalseColourApp:
                 denom_mean = float(np.mean(denom) + EPSILON)
                 arr = arr / (_safe_divide(denom, denom_mean))
             self.source_bands[k] = arr
+
+    def _calibrate_to_reflectance(self) -> Dict[str, np.ndarray]:
+        """Approximate reflectance from corrected source bands using a white reference ROI.
+        Formula: refl ≈ I / I_white  (dark/flat already handled earlier). If no ROI is set,
+        falls back to global mean normalization.
+        Returns a dict of float32 arrays in [0, ~1+].
+        """
+        refl: Dict[str, np.ndarray] = {}
+        # Use ROI if provided
+        if self.white_patch_coords is not None:
+            x1, y1, x2, y2 = self.white_patch_coords
+        else:
+            x1 = y1 = 0
+            any_arr = next(iter(self.source_bands.values()))
+            y2, x2 = any_arr.shape
+        for k, arr in self.source_bands.items():
+            a = arr.astype(np.float32)
+            roi_mean = float(np.mean(a[y1:y2, x1:x2]) + EPSILON)
+            scale = self.params.target_reflectance / roi_mean
+            refl[k] = np.clip(a * scale, 0.0, None).astype(np.float32)
+        return refl
 
 
     def _stretch_percentile_gamma(self, arr, low_p, high_p, gamma):
